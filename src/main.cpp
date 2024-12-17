@@ -2,6 +2,7 @@
 #include <WiFiManager.h>
 #include <time.h>
 #include <Preferences.h>
+#include <esp_sntp.h>
 
 const char* ntpServer = "pool.ntp.org";
 
@@ -22,6 +23,10 @@ char raiseHourStr[3];
 char raiseMinStr[3];
 char lowerHourStr[3];
 char lowerMinStr[3];
+
+int timeFailCount = 0;
+unsigned long lastTimeSync = 0;
+const unsigned long maxTimeSyncDelay = 1800 * 1000; // 30 min
 
 void raise() {
   Serial.println("Raising");
@@ -57,9 +62,14 @@ bool tryParseMinute(const char* input, int& out) {
   return false;
 }
 
-void saveConfigCallback () {
+void saveConfigCallback() {
   Serial.println("Should save config");
   shouldSaveConfig = true;
+}
+
+void timeSyncCallback(struct timeval *tv) {
+  lastTimeSync = millis();
+  digitalWrite(LED_PIN, HIGH);
 }
 
 void setup() {
@@ -70,6 +80,7 @@ void setup() {
     pinMode(LOWER_PIN, INPUT);
     pinMode(LED_PIN, OUTPUT);
     pinMode(RESET_PIN, INPUT_PULLUP);
+    digitalWrite(LED_PIN, LOW);
     Serial.begin(115200);
     delay(500);
     if (digitalRead(RESET_PIN) == LOW) {
@@ -116,7 +127,7 @@ void setup() {
     snprintf(ssid, sizeof(ssid), "ProjectorScreenTimer-%llX", ESP.getEfuseMac());
 
     if (!wm.autoConnect(ssid)) {
-      Serial.println("failed to connect and hit timeout");
+      Serial.println("Restarting: Could not connect to WiFi");
       delay(3000);
       ESP.restart();
     }
@@ -153,22 +164,33 @@ void setup() {
     }
 
     Serial.println("WiFi connected");
+    sntp_set_time_sync_notification_cb(timeSyncCallback);
     configTzTime(timezone, ntpServer);
+    sntp_set_sync_interval(600 * 1000); // 10 minutes
 
     Serial.printf("Raise Hour: %d\n", raiseHour);
     Serial.printf("Raise Minute: %d\n", raiseMinute);
     Serial.printf("Lower Hour: %d\n", lowerHour);
     Serial.printf("Lower Minute: %d\n", lowerMinute);
-    digitalWrite(LED_PIN, HIGH);
 }
 
 void loop() {
   delay(1000);
+  if (millis() - lastTimeSync > maxTimeSyncDelay) {
+    Serial.println("Restarting: Could not contact NTP server after multiple retries");
+    ESP.restart(); // NTP not synced, restart.
+  }
+
   struct tm timeinfo;
   if(!getLocalTime(&timeinfo)){
     Serial.println("Failed to obtain time");
+    if(timeFailCount++ > 10) {
+      Serial.println("Restarting: Failed to obtain time 10 times");
+      ESP.restart();
+    }
     return;
   }
+  timeFailCount = 0;
   unsigned long currentTime = millis();
   if (timeinfo.tm_hour == raiseHour && timeinfo.tm_min == raiseMinute) {
     raise();
